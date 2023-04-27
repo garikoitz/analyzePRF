@@ -6,10 +6,11 @@ function [seeds,rvalues] = analyzePRF_computesupergridseeds(res,stimulus,data,mo
 % <stimulus> is a cell vector of time x (pixels+1)
 % <data> is a cell vector of X x Y x Z x time (or XYZ x time)
 % <modelfun> is a function that accepts parameters (pp) and stimuli (dd) and outputs predicted time-series (time x 1)
-% <maxpolydeg> is a vector of degrees (one element for each run)
+% <maxpolydeg> is a vector of degrees (one element for each run). elements can be NaN (meaning don't use any polynomials).
 % <dimdata> is number of dimensions that pertain to voxels
 % <dimtime> is the dimension that is the time dimension
-% <typicalgain> is a typical value for the gain in each time-series
+% <typicalgain> is a typical value for the gain in each time-series.
+%   can be NaN, in which case we attempt to calculate a more proper gain seeding.
 % <noisereg> is [] or a set of noise regressors (cell vector of matrices)
 %
 % this is an internal function called by analyzePRF.m.  this function returns <seeds>
@@ -18,11 +19,16 @@ function [seeds,rvalues] = analyzePRF_computesupergridseeds(res,stimulus,data,mo
 % (or XYZ x 1) with the corresponding correlation (r) values.
 %
 % history:
-% 2015/02/07 - make less memory intensive
+% - 2022/06/14 - the case of non-square stimulus preparations was being handled
+%                incorrectly. it is now fixed.
+% - 2021/11/11 - remove the forcing of single format and instead inherit from <data>.
+%                also, explicitly handle some pernicious corner cases.
+% - 2015/02/07 - make less memory intensive
 
 % internal notes:
 % - note that the gain seed is fake (it is not set the correct value but instead
-%   to the <typicalgain>)
+%   to the <typicalgain>).  however, if <typicalgain> is passed as NaN, we attempt
+%   to perform a more proper gain seeding.
 
 % internal constants
 eccs = [0 0.00551 0.014 0.0269 0.0459 0.0731 0.112 0.166 0.242 0.348 0.498 0.707 1];
@@ -52,8 +58,8 @@ for p=1:length(eccs)
     end
     for s=1:length(ssindices)
       for r=1:length(expts)
-        allseeds(cnt,:) = [(1+res(1))/2 - sin(angs(q)) * (eccs(p)*resmx) ...
-                           (1+res(2))/2 + cos(angs(q)) * (eccs(p)*resmx) ...
+        allseeds(cnt,:) = [(1+resmx)/2 - sin(angs(q)) * (eccs(p)*resmx) ...
+                           (1+resmx)/2 + cos(angs(q)) * (eccs(p)*resmx) ...
                            ssindices(s)*sqrt(expts(r)) 1 expts(r)];
         cnt = cnt + 1;
       end
@@ -65,7 +71,7 @@ allseeds(cnt:end,:) = [];  % chop because of the omission above
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% generate the predicted time-series for each seed
 
 % generate predicted time-series [note that some time-series are all 0]
-predts = zeros(sum(cellfun(@(x) size(x,1),stimulus)),size(allseeds,1),'single');  % time x seeds
+predts = zeros(sum(cellfun(@(x) size(x,1),stimulus)),size(allseeds,1),class(data{1}));  % time x seeds
 temp = catcell(1,stimulus);
 fprintf('generating super-grid time-series...'); tic
 parfor p=1:size(allseeds,1)
@@ -93,7 +99,11 @@ clear temp;
 % construct polynomials, noise regressors, and projection matrix
 pregressors = {};
 for p=1:length(maxpolydeg)
-  pregressors{p} = constructpolynomialmatrix(size(data{p},dimtime),0:maxpolydeg(p));
+  if isnan(maxpolydeg(p))
+    pregressors{p} = zeros(size(data{p},dimtime),0);
+  else
+    pregressors{p} = constructpolynomialmatrix(size(data{p},dimtime),0:maxpolydeg(p));
+  end
   if ~isempty(noisereg)
     pregressors{p} = cat(2,pregressors{p},noisereg{p});
   end
@@ -101,7 +111,13 @@ end
 pmatrix = projectionmatrix(blkdiag(pregressors{:}));
 
 % project out and scale to unit length
-predts = unitlength(pmatrix*predts,                                1,[],0);  % time x seeds   [NOTE: some are all NaN]
+predts = pmatrix*predts;  % time x seeds
+predtslen = vectorlength(predts,1);  % 1 x seeds
+predts = bsxfun(@rdivide,predts,predtslen);  % time x seeds
+  % really ugly (deal with time series that have no length)
+predts(repmat(predtslen==0,[size(predts,1) 1])) = 0;
+predtslen(predtslen==0) = 1;
+  % OLD: predts = unitlength(pmatrix*predts,1,[],0);  % time x seeds   [NOTE: some are all NaN]
   % OLD: datats = unitlength(pmatrix*squish(catcell(dimtime,data),dimdata)',1,[],0);  % time x voxels
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% find the seed with the max correlation
@@ -110,23 +126,45 @@ predts = unitlength(pmatrix*predts,                                1,[],0);  % t
 chunks = chunking(1:numvxs,100);
 rvalues = {};
 bestseedix = {};
+propergain = {};
 fprintf('finding best seed for each voxel.\n');
 parfor p=1:length(chunks)
 
   % project out and scale to unit length
-  datats = unitlength(pmatrix*catcell(2,cellfun(@(x) subscript(squish(x,dimdata),{chunks{p} ':'}),data,'UniformOutput',0))',1,[],0);  % time x voxels
+  datats = pmatrix*catcell(2,cellfun(@(x) subscript(squish(x,dimdata),{chunks{p} ':'}),data,'UniformOutput',0))';
+  datatslen = vectorlength(datats,1);  % 1 x voxels
+  datats = bsxfun(@rdivide,datats,datatslen);  % time x voxels
+    % really ugly (deal with time series that have no length)
+  datats(repmat(datatslen==0,[size(datats,1) 1])) = 0;
+  datatslen(datatslen==0) = 1;
+    % OLD: datats = unitlength(temp,1,[],0);  % time x voxels
 
   % voxels x 1 with index of the best seed (max corr)
   [rvalues{p},bestseedix{p}] = max(datats'*predts,[],2);  % voxels x seeds -> max corr along dim 2 [NaN is ok]
+  
+  % voxels x 1 with best fitting beta weight
+  propergain{p} = rvalues{p} .* (vflatten(datatslen) ./ vflatten(predtslen(bestseedix{p})));
+     % best fitting beta weight is something like corr(a(:),b(:)) * bb/aa
 
 end
 rvalues = catcell(1,rvalues);        % voxels x 1
 bestseedix = catcell(1,bestseedix);  % voxels x 1
+propergain = catcell(1,propergain);  % voxels x 1
 
 % prepare output
 rvalues = reshape(rvalues,[sizefull(data{1},dimdata) 1]);
 seeds = allseeds(bestseedix,:);  % voxels x parameters
-seeds(:,4) = typicalgain;        % set gain to typical gain
+
+% Note: This modification is similar to the special implementation for the HCP 7T RETINOTOPY DATASET.
+% Here, we set the gain seed to be 0.75 of the gain found in the grid fit.
+if isnan(typicalgain)
+  propergain(~isfinite(propergain)) = 0;  % SOMEWHAT HACKY BUT FOR SAFETY!!!
+  seeds(:,4) = .75*max(propergain,0);  % NOTE: if the best seed in a corr sense is negative weight, just set to 0
+else
+  seeds(:,4) = typicalgain;
+end
+
+% prepare output
 seeds = reshape(seeds,[sizefull(data{1},dimdata) size(allseeds,2)]);
 
 

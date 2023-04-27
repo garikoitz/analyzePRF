@@ -4,20 +4,23 @@ function results = analyzePRF(stimulus,data,tr,options)
 %
 % <stimulus> provides the apertures as a cell vector of R x C x time.
 %   values should be in [0,1].  the number of time points can differ across runs.
+%   consider passing <stimulus> in double format to ensure that computation
+%   occurs with optimal precision (less chance of local minima)!
 % <data> provides the data as a cell vector of voxels x time.  can also be
-%   X x Y x Z x time.  the number of time points should match the number of 
+%   X x Y x Z x time.  the number of time points should match the number of
 %   time points in <stimulus>.
 % <tr> is the TR in seconds (e.g. 1.5)
 % <options> (optional) is a struct with the following fields:
 %   <vxs> (optional) is a vector of voxel indices to analyze.  (we automatically
-%     sort the voxel indices and ensure uniqueness.)  default is 1:V where 
-%     V is total number of voxels.  to reduce computational time, you may want 
+%     sort the voxel indices and ensure uniqueness.)  default is 1:V where
+%     V is total number of voxels.  to reduce computational time, you may want
 %     to create a binary brain mask, perform find() on it, and use the result as <vxs>.
 %   <wantglmdenoise> (optional) is whether to use GLMdenoise to determine
-%     nuisance regressors to add into the PRF model.  note that in order to use
+%     nuisance regressors to add into the PRF model.  this is fairly experimental
+%     and not recommended for general use at this time.  note that in order to use
 %     this feature, there must be at least two runs (and conditions must repeat
 %     across runs).  we automatically determine the GLM design matrix based on
-%     the contents of <stimulus>.  special case is to pass in the noise regressors 
+%     the contents of <stimulus>.  special case is to pass in the noise regressors
 %     directly (e.g. from a previous call).  default: 0.
 %   <hrf> (optional) is a column vector with the hemodynamic response function (HRF)
 %     to use in the model.  the first value of <hrf> should be coincident with the onset
@@ -27,16 +30,31 @@ function results = analyzePRF(stimulus,data,tr,options)
 %   <maxpolydeg> (optional) is a non-negative integer indicating the maximum polynomial
 %     degree to use for drift terms.  can be a vector whose length matches the number
 %     of runs in <data>.  default is to use round(L/2) where L is the number of minutes
-%     in the duration of a given run.
-%   <seedmode> (optional) is a vector consisting of one or more of the
+%     in the duration of a given run.  special case is NaN, which means to not include
+%     any drift terms at all (not even a constant term).
+%   <seedmode> (NOW REQUIRED) is a vector consisting of one or more of the
 %     following values (we automatically sort and ensure uniqueness):
 %       0 means use generic large PRF seed
 %       1 means use generic small PRF seed
 %       2 means use best seed based on super-grid
-%     default: [0 1 2].  a special case is to pass <seedmode> as -2.  this causes the
+%     a special case is to pass <seedmode> as -2.  this causes the
 %     best seed based on the super-grid to be returned as the final estimate, thereby
 %     bypassing the computationally expensive optimization procedure.  further notes
-%     on this case are given below.
+%     on this case are given below.  another special case is passing <seedmode> as
+%     {S}, in which case we directly use the seeds contained in S, a matrix of
+%     dimensions one-or-more-seeds x 5 parameters as the PRF seed(s).
+%     NOTE: <seedmode> used to be optional (and defaulted to [0 1 2]). The new
+%           behavior is to require the user to specify this. A suggestion is
+%           to set <seedmode> to 2. This is a fairly robust strategy (but has
+%           an initial overhead for the seed evaluation. An alternative is to
+%           set <seedmode> to 0, which avoids the overhead, but is more likely
+%           to get stuck at a local minimum close to the initial seed.
+%   <modelmode> (optional) is
+%     1 means a two-stage approach (optimize all parameters excluding exponent,
+%       and then optimize all parameters)
+%     2 means a one-stage approach (optimize all parameters)
+%     3 means a one-stage approach (optimize all parameters excluding exponent)
+%     default: 1.
 %   <xvalmode> (optional) is
 %     0 means just fit all the data
 %     1 means two-fold cross-validation (first half of runs; second half of runs)
@@ -44,20 +62,32 @@ function results = analyzePRF(stimulus,data,tr,options)
 %     default: 0.  (note that we round when halving.)
 %   <numperjob> (optional) is
 %     [] means to run locally (not on the cluster)
-%     N where N is a positive integer indicating the number of voxels to analyze in each 
+%     N where N is a positive integer indicating the number of voxels to analyze in each
 %       cluster job.  this option requires a customized computational setup!
 %     default: [].
 %   <maxiter> (optional) is the maximum number of iterations.  default: 500.
 %   <display> (optional) is 'iter' | 'final' | 'off'.  default: 'iter'.
+%   <algorithm> (optional) is passed to MATLAB's optimizer, can be like
+%     'levenberg-marquardt', 'trust-region-reflective', etc.
+%     default: 'levenberg-marquardt'.
 %   <typicalgain> (optional) is a typical value for the gain in each time-series.
-%     default: 10.
+%     default: 10.  if you are using <seedmode> of either 2 or -2, this involves
+%     the "super-grid" strategy, and in this case, we ignore <typicalgain> and
+%     instead do some special calculations to set the gain more appropriately
+%     (specifically, to 0.75 of the value that would produce the least-squares
+%     fit for the chosen seed, with a restriction to non-negative values only).
+%   <exptlowerbound> (optional) is the lower bound for the exponent parameter.
+%     This should be a positive number. Default: 0.001.
+%   <wantsparse> (optional) is whether to convert stimulus to sparse (for
+%     potential major execution speed-ups). Default: 1.
 %
 % Analyze pRF data and return the results.
 %
 % The results structure contains the following fields:
 % <ang> contains pRF angle estimates.  Values range between 0 and 360 degrees.
 %   0 corresponds to the right horizontal meridian, 90 corresponds to the upper vertical
-%   meridian, and so on.
+%   meridian, and so on.  In the case where <ecc> is estimated to be exactly equal
+%   to 0, the corresponding <ang> value is deliberately set to NaN.
 % <ecc> contains pRF eccentricity estimates.  Values are in pixel units with a lower
 %   bound of 0 pixels.
 % <rfsize> contains pRF size estimates.  pRF size is defined as sigma/sqrt(n) where
@@ -70,9 +100,9 @@ function results = analyzePRF(stimulus,data,tr,options)
 %   Values are in percentages and generally range between 0% and 100%.  The R^2 values
 %   are computed after projecting out polynomials from both the data and the model fit.
 %   (Because of this projection, R^2 values can sometimes drop below 0%.)  Note that
-%   if cross-validation is used (see <xvalmode>), the interpretation of <R2> changes
-%   accordingly.
-% <resnorms> and <numiters> contain optimization details (residual norms and 
+%   if cross-validation is used (see <xvalmode>), the <R2> is still the _training_
+%   performance for each iteration.
+% <resnorms> and <numiters> contain optimization details (residual norms and
 %   number of iterations, respectively).
 % <meanvol> contains the mean volume, that is, the mean of each voxel's time-series.
 % <noisereg> contains a record of the noise regressors used in the model.
@@ -81,12 +111,17 @@ function results = analyzePRF(stimulus,data,tr,options)
 %   the user (as described above).
 % <options> contains a record of the options used in the call to analyzePRF.m.
 %
+% If cross-validation (<xvalmode> ~= 0) is used, the results structure also contains:
+% <testperformance> contains R^2 values for the testing performance on each iteration.
+% <aggregatedtestperformance> contains R^2 values for testing performance after
+%   aggregating predictions across iterations.
+%
 % Details on the pRF model:
 % - Before analysis, we zero out any voxel that has a non-finite value or has all zeros
 %   in at least one of the runs.  This prevents weird issues due to missing or bad data.
 % - The pRF model that is fit is similar to that described in Dumoulin and Wandell (2008),
-%   except that a static power-law nonlinearity is added to the model.  This new model, 
-%   called the Compressive Spatial Summation (CSS) model, is described in Kay, Winawer, 
+%   except that a static power-law nonlinearity is added to the model.  This new model,
+%   called the Compressive Spatial Summation (CSS) model, is described in Kay, Winawer,
 %   Mezer, & Wandell (2013).
 % - The model involves computing the dot-product between the stimulus and a 2D isotropic
 %   Gaussian, raising the result to an exponent, scaling the result by a gain factor,
@@ -95,18 +130,20 @@ function results = analyzePRF(stimulus,data,tr,options)
 % - The 2D isotropic Gaussian is scaled such that the summation of the values in the
 %   Gaussian is equal to one.  This eases the interpretation of the gain of the model.
 % - The exponent parameter in the model is constrained to be non-negative.
-% - The gain factor in the model is constrained to be non-negative; this aids the 
+% - The gain factor in the model is constrained to be non-negative; this aids the
 %   interpretation of the model (e.g. helps avoid voxels with negative BOLD responses
 %   to the stimuli).
-% - The workhorse of the analysis is fitnonlinearmodel.m, which is essentially a wrapper 
-%   around routines in the MATLAB Optimization Toolbox.  We use the Levenberg-Marquardt 
-%   algorithm for optimization, minimizing squared error between the model and the data.
+% - The workhorse of the analysis is fitnonlinearmodel.m, which is essentially a wrapper
+%   around routines in the MATLAB Optimization Toolbox.  We default to use the
+%   Levenberg-Marquardt algorithm for optimization (but this can be controlled by
+%   options.algorithm), minimizing squared error between the model and the data.
 % - A two-stage optimization strategy is used whereby all parameters excluding the
-%   exponent parameter are first optimized (holding the exponent parameter fixed) and 
-%   then all parameters are optimized (including the exponent parameter).  This 
+%   exponent parameter are first optimized (holding the exponent parameter fixed) and
+%   then all parameters are optimized (including the exponent parameter).  This
 %   strategy helps avoid local minima.
 %
 % Regarding GLMdenoise:
+% - Note this is probably not recommended for use due to the various complexities involved.
 % - If the <wantglmdenoise> option is specified, we derive noise regressors using
 %   GLMdenoise prior to model fitting.  This is done by creating a GLM design matrix
 %   based on the contents of <stimulus> and then using this design matrix in conjunction
@@ -115,7 +152,7 @@ function results = analyzePRF(stimulus,data,tr,options)
 %   additively, just like the polynomial regressors).
 %
 % Regarding seeding issues:
-% - To minimize the impact of local minima, the default strategy is to perform full 
+% - To minimize the impact of local minima, the default strategy is to perform full
 %   optimizations starting from three different initial seeds.
 % - The first seed is a generic large pRF that is centered with respect to the stimulus,
 %   has a pRF size equal to 1/4th of the stimulus extent (thus, +/- 2 pRF sizes matches
@@ -123,10 +160,10 @@ function results = analyzePRF(stimulus,data,tr,options)
 % - The second seed is a generic small pRF that is just like the first seed except has
 %   a pRF size that is 10 times smaller.
 % - The third seed is a "supergrid" seed that is identified by performing a quick grid
-%   search prior to optimization (similar in spirit to methods described in Dumoulin and 
-%   Wandell, 2008).  In this procedure, a list of potential seeds is constructed by 
-%   exploring a range of eccentricities, angles, and exponents.  For each potential 
-%   seed, the model prediction is computed, and the seed that produces the closest 
+%   search prior to optimization (similar in spirit to methods described in Dumoulin and
+%   Wandell, 2008).  In this procedure, a list of potential seeds is constructed by
+%   exploring a range of eccentricities, angles, and exponents.  For each potential
+%   seed, the model prediction is computed, and the seed that produces the closest
 %   match to the data is identified.  Note that the supergrid seed may be different
 %   for different voxels.
 %
@@ -134,18 +171,71 @@ function results = analyzePRF(stimulus,data,tr,options)
 % - When <seedmode> is -2, optimization is not performed and instead the best seed
 %   based on the super-grid is returned as the final estimate.  If this case is used,
 %   we automatically enforce that:
-%   - opt.xvalmode is 0
-%   - opt.vxs is []
-%   - opt.numperjob is []
+%   - options.xvalmode is 0
+%   - options.vxs is []
+%   - options.numperjob is []
 %   Also, in terms of outputs:
-%   - The <gain> output is not estimated, and gain values are just returned as <typicalgain>.
+%   - The <gain> output is set to 0.75 of the idealized setting.
 %   - The <R2> output will contain correlation values (r) that range between -1 and 1.
 %     These correlation values reflect the correlation between the model prediction and the
 %     data after projecting out polynomial regressors and the noise regressors (if
 %     <wantglmdenoise> is specified) from both the model prediction and the data.
 %   - The <resnorms> and <numiters> outputs will be empty.
 %
+% Regarding using a linear pRF model:
+% - Recent options that have now been implemented will allow easy fitting of
+%   a linear pRF model (i.e. exponent equal to 1).  To do this, you can use
+%   <modelmode> set to 3, which will cause the exponent to not be optimized.
+%   And then in conjunction with that, you can set <seedmode> to an explicit
+%   seed like {[R C SD GAIN 1]} (where the R and C provide the row and column
+%   index of the seed (in pixel units), SD provides the sigma parameter (in
+%   pixel units), GAIN is the gain parameter, and 1 is the exponent parameter.
+%   This is a little clunky but works...
+%
 % history:
+% 2022/06/14 - the case of non-square stimulus preparations was being handled
+%              incorrectly (e.g. ang and ecc were being computed incorrectly).
+%              it is now fixed.
+% 2022/03/26 - implement new option <wantsparse>. this changes past behavior,
+%              in a sense, but the differences are tiny.
+% 2021/12/05 - tag as version 1.5.
+% 2021/12/04 - implement new option <exptlowerbound>. this changes past behavior.
+%              for very small exponents, strange numerical inaccuracies were
+%              occurring, causing implausible 'rfsize' outputs. after enforcing
+%              a reasonable lower bound (e.g. 0.001), these inaccuracies were
+%              resolved.
+% 2021/12/04 - we now force the user to specify <seedmode>. this is so that the
+%              user understands this is major parameter that will affect speed
+%              and accuracy.
+% 2021/11/22 - tag this as version 1.4.
+% 2021/11/22 - For 2 and -2 "supergrid" cases for <seedmode>, we now always
+%              use the <typicalgain>==NaN setting, which means to use an
+%              appropriate initial value for the gain. this should improve
+%              overall result quality. Note that this changes past behavior!
+% 2021/11/11 - tag this as version 1.3.1.
+% 2021/11/11 - implemented a speed-up.
+% 2021/11/11 - tag this as version 1.3.
+% 2021/11/11 - update exampledataset.mat to be in double format.
+%              also, we now issue a warning if the user provides single-format data!
+% 2021/03/22 - Several changes:
+%              (1) When eccentricity is estimated to be exactly 0, the
+%                  corresponding angle values are now deliberately
+%                  set to NaN. Previous behavior resulted in angle values being
+%                  returned as 0 (since atan2(0,0) results in 0).
+%              (2) Add support for <maxpolydeg> to be NaN which allows
+%                  for no drift terms to be included (not even a constant).
+%              (3) Add support for allowing user input <options.algorithm>.
+%              (4) Add support for <options.seedmode> to be the {S} case.
+%                  This allows the user to directly specify the initial seed(s).
+%              (5) Add support for <modelmode> to be 3. This makes it such that
+%                  the exponent is fixed and not optimized. This could be useful
+%                  to fit stricly linear pRF models (see documentation above).
+% 2020/06/18 - add <modelmode> input option.  Fix opt -> options typo bug.
+% 2020/03/05 - BUG FIX. Previously, when <xvalmode> ~= 0, the <R2> values that were output
+%              were training performance values (even though we implied that they were
+%              testing performance values). Now, we preserve that behavior, but now also
+%              output new fields <testperformance> and <aggregatedtestperformance>,
+%              which indicate the cross-validated values.
 % 2019/08/23 - Major change: the <stimulus> variable is now no longer forced to become
 %              single format. This means the user controls whether computations are done
 %              in double or single format. Please note that behavior (including finicky
@@ -192,6 +282,11 @@ if ~iscell(data)
   data = {data};
 end
 
+% check single or double
+if ~isequal(class(stimulus{1}),'double') || ~isequal(class(data{1}),'double')
+  warning('either <stimulus> or <data> is not double format. use double format for better accuracy/precision!');
+end
+
 % calc
 is3d = size(data{1},4) > 1;
 if is3d
@@ -227,7 +322,11 @@ if ~isfield(options,'maxpolydeg') || isempty(options.maxpolydeg)
   options.maxpolydeg = [];
 end
 if ~isfield(options,'seedmode') || isempty(options.seedmode)
-  options.seedmode = [0 1 2];
+  error('<seedmode> is now required to be specified! Suggestion is 2 (see documentation).');
+  %%options.seedmode = [0 1 2];
+end
+if ~isfield(options,'modelmode') || isempty(options.modelmode)
+  options.modelmode = 1;
 end
 if ~isfield(options,'xvalmode') || isempty(options.xvalmode)
   options.xvalmode = 0;
@@ -241,19 +340,30 @@ end
 if ~isfield(options,'display') || isempty(options.display)
   options.display = 'iter';
 end
+if ~isfield(options,'algorithm') || isempty(options.algorithm)
+  options.algorithm = 'levenberg-marquardt';
+end
 if ~isfield(options,'typicalgain') || isempty(options.typicalgain)
   options.typicalgain = 10;
+end
+if ~isfield(options,'exptlowerbound') || isempty(options.exptlowerbound)
+  options.exptlowerbound = 0.001;
+end
+if ~isfield(options,'wantsparse') || isempty(options.wantsparse)
+  options.wantsparse = 1;
 end
 
 % massage
 wantquick = isequal(options.seedmode,-2);
-options.seedmode = union(options.seedmode(:),[]);
+if ~iscell(options.seedmode)
+  options.seedmode = union(options.seedmode(:),[]);
+end
 
 % massage more
 if wantquick
-  opt.xvalmode = 0;
-  opt.vxs = 1:numvxs;
-  opt.numperjob = [];
+  options.xvalmode = 0;
+  options.vxs = 1:numvxs;
+  options.numperjob = [];
 end
 
 % calc
@@ -265,6 +375,14 @@ for p=1:length(stimulus)
   stimulus{p} = [stimulus{p} p*ones(size(stimulus{p},1),1)];  % add a dummy column to indicate run breaks
 %% REMOVED ON AUG 23 2019!  THIS CHANGES PAST BEHAVIOR.
 %%  stimulus{p} = single(stimulus{p});  % make single to save memory
+  if options.wantsparse
+    if isequal(class(stimulus{p}),'double')
+      fprintf('converting stimulus (run %d) to sparse.\n',p);
+      stimulus{p} = sparse(stimulus{p});
+    else
+      fprintf('stimulus (run %d) is not double, so not converting to sparse.\n');
+    end
+  end
 end
 
 % deal with data badness (set bad voxels to be always all 0)
@@ -318,86 +436,50 @@ end
 % This is the old version
 %{
 % define the model (parameters are R C S G N)
-modelfun = @(pp,dd) conv2run(posrect(pp(4)) * (dd*[vflatten(placematrix(zeros(res),makegaussian2d(resmx,pp(1),pp(2),abs(pp(3)),abs(pp(3)),xx,yy,0,0) / (2*pi*abs(pp(3))^2))); 0]) .^ posrect(pp(5)),options.hrf,dd(:,prod(res)+1));
-model = {{[] [1-res(1)+1 1-res(2)+1 0    0   NaN;
-              2*res(1)-1 2*res(2)-1 Inf  Inf Inf] modelfun} ...
-         {@(ss)ss [1-res(1)+1 1-res(2)+1 0    0   0;
-                   2*res(1)-1 2*res(2)-1 Inf  Inf Inf] @(ss)modelfun}};
-%}
-
-
-% This is the new version
-% {
-% define the model (parameters are R C S G N)
-modelfun = @(pp,dd) conv2run(posrect(pp(4)) * (dd*[vflatten(placematrix(zeros(res),makegaussian2d(resmx,pp(1),pp(2),abs(pp(3)),abs(pp(3)),xx,yy,0,0) / (2*pi*abs(pp(3))^2))); 0]) .^ posrect(pp(5)),options.hrf,dd(:,prod(res)+1));
-model = {{[] [1-res(1)+1 1-res(2)+1 0    0   1;
-              2*res(1)-1 2*res(2)-1 Inf  Inf 1] modelfun} ...
-         {@(ss)ss [1-res(1)+1 1-res(2)+1 0    0   1;
-                   2*res(1)-1 2*res(2)-1 Inf  Inf 1] @(ss)modelfun}};
-%}
-
-
-
-
-               
-%% Little effort to clarify the modelfun function. This is just a comment.
-
-% Inputs of the function
-%   pp = parameters matrix
-%   dd = data matrix
-% Components of the algorithm, from above:
-%   The model involves computing the dot-product between the stimulus and a 2D isotropic
-%   Gaussian, raising the result to an exponent, scaling the result by a gain factor,
-%   and then convolving the result with a hemodynamic response function (HRF).  Polynomial
-%   terms are included (on a run-by-run basis) to model the baseline signal level.
-
-% modelfun = @(pp,dd) ...  % Defines the inputs to the function, params (to be guessed) and data
-%            conv2run(...  % Defines the main function, a convolution. We will want to guess the params
-%               posrect(pp(4)) * ...  % FIRST part of the convolution. It has form A * B. This is A
-%                 (...                  % B starts here. Separate it as well
-%                   dd * ...               % Data matrix
-%                   [vflatten( ...         % Vector. vflatten just returns a vertical vector. Same as kk(:).
-%                         placematrix( ...    % Substitutes matrix 2 into matrix 1 depending on matrix 3
-%                              zeros(res), ...    % Matrix 1
-%                              makegaussian2d(resmx,pp(1),pp(2),abs(pp(3)),abs(pp(3)),xx,yy,0,0) / ... % Matrix 2: element1
-%                              (2*pi*abs(pp(3))^2) ...                                                 % Matrix 2: element2
-%                                     ) ...   % Close placematrix
-%                             )...          % Close vflatten 
-%                     ;0]...               % Adds a 0 to the flattened matrix (vector) at the end
-%                  ).^posrect(pp(5)),...% End of B part B of A*B part of the convolution. This is the parameter in the exponential
-%                options.hrf,...      % SECOND part of the convolution, the HRF signal
-%                dd(:,prod(res)+1) ...% THIRD part of the conv, according knk. Separates convs between runs. This third part is basically a categorization. See help conv2run
-%              );          % Close the convolution function
-% Now the model function needs to be incorporated into a model that lsqcurvefit understands
-% Create two different functions that, fitnonlinear.m will loop over the 2 functions. From above:
-%   A two-stage optimization strategy is used whereby all parameters excluding the
-%   exponent parameter are first optimized (holding the exponent parameter fixed) and 
-%   then all parameters are optimized (including the exponent parameter).  This 
-%   strategy helps avoid local minima.
-
+modelfun = @(pp,dd) conv2run(posrect(pp(4)) * (dd*[vflatten(placematrix(zeros(res),makegaussian2d(resmx,pp(1),pp(2),abs(pp(3)),abs(pp(3)),xx,yy,0,0) / (2*pi*abs(pp(3))^2))); 0]) .^ posrect(pp(5),options.exptlowerbound),options.hrf,dd(:,prod(res)+1));
+switch options.modelmode   % NOTE: these bounds may not have any effect if you use levenberg-marquardt optimization!
+case 1
+  model = {{[] [1-resmx+1 1-resmx+1 0    0   NaN;
+                2*resmx-1 2*resmx-1 Inf  Inf Inf] modelfun} ...
+           {@(ss)ss [1-resmx+1 1-resmx+1 0    0   options.exptlowerbound;
+                     2*resmx-1 2*resmx-1 Inf  Inf Inf] @(ss)modelfun}};
+case 2
+  model = {{[] [1-resmx+1 1-resmx+1 0    0   options.exptlowerbound;
+                2*resmx-1 2*resmx-1 Inf  Inf Inf] modelfun}};
+case 3
+  model = {{[] [1-resmx+1 1-resmx+1 0    0   NaN;
+                2*resmx-1 2*resmx-1 Inf  Inf Inf] modelfun}};
+end
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% PREPARE SEEDS
 
 % init
 seeds = [];
 
-% generic large seed
-if ismember(0,options.seedmode)
+if iscell(options.seedmode)
   seeds = [seeds;
-           (1+res(1))/2 (1+res(2))/2 resmx/4*sqrt(0.5) options.typicalgain 0.5];
-end
+           options.seedmode{1}];
+else
 
-% generic small seed
-if ismember(1,options.seedmode)
-  seeds = [seeds;
-           (1+res(1))/2 (1+res(2))/2 resmx/4*sqrt(0.5)/10 options.typicalgain 0.5];
-end
+  % generic large seed
+  if ismember(0,options.seedmode)
+    seeds = [seeds;
+             (1+resmx)/2 (1+resmx)/2 resmx/4*sqrt(0.5) options.typicalgain 0.5];
+  end
 
-% super-grid seed
-if any(ismember([2 -2],options.seedmode))
-  [supergridseeds,rvalues] = analyzePRFcomputesupergridseeds(res,stimulus,data,modelfun, ...
-                                                   options.maxpolydeg,dimdata,dimtime, ...
-                                                   options.typicalgain,noisereg);
+  % generic small seed
+  if ismember(1,options.seedmode)
+    seeds = [seeds;
+             (1+resmx)/2 (1+resmx)/2 resmx/4*sqrt(0.5)/10 options.typicalgain 0.5];
+  end
+
+  % super-grid seed
+  if any(ismember([2 -2],options.seedmode))
+    [supergridseeds,rvalues] = analyzePRFcomputesupergridseeds(res,stimulus,data,modelfun, ...
+                                                     options.maxpolydeg,dimdata,dimtime, ...
+                                                     NaN,noisereg);
+  end
+
 end
 
 % make a function that individualizes the seeds
@@ -450,20 +532,20 @@ else
       filename0 = sprintf('stim%s.mat',randomword(5));  % file name
       localfile0 = [tempdir '/' filename0];             % local path to file
       remotefile0 = [remotedir '/' filename0];          % remote path to file
-  
+
       % redo if file already exists locally or remotely
       if exist(localfile0) || 0==unix(sprintf('ssh %s ls %s',remotelogin,remotefile0))
         continue;
       end
-  
+
       % save file and transport it
       save(localfile0,'stimulus');
       assert(0==unix(sprintf('rsync -av %s %s:"%s/"',localfile0,remotelogin,remotedir)));
-  
+
       % record
       localfilestodelete{end+1} = localfile0;
       remotefilestodelete{end+1} = remotefile0;
-  
+
       % stop
       break;
     end
@@ -477,12 +559,12 @@ else
       filename0 = sprintf('data%s',randomword(5));   % directory name that will contain 001.bin, etc.
       localfile0 = [tempdir '/' filename0];          % local path to dir
       remotefile0 = [remotedir '/' filename0];       % remote path to dir
-  
+
       % redo if dir already exists locally or remotely
       if exist(localfile0) || 0==unix(sprintf('ssh %s ls %s',remotelogin,remotefile0))
         continue;
       end
-  
+
       % save files and transport them
       assert(mkdir(localfile0));
       for p=1:numruns
@@ -547,7 +629,7 @@ else
     'vxs',options.vxs, ...
     'model',{model}, ...
     'seed',seedfun, ...
-    'optimoptions',{{'Display' options.display 'Algorithm' 'levenberg-marquardt' 'MaxIter' options.maxiter}}, ...
+    'optimoptions',{{'Display' options.display 'Algorithm' options.algorithm 'MaxIter' options.maxiter}}, ...
     'wantresampleruns',wantresampleruns, ...
     'resampling',resampling, ...
     'metric',@calccod, ...
@@ -582,7 +664,7 @@ else
 
     % submit jobs
     jobnames = {};
-    jobnames = [jobnames {makedirid(opt.outputdir,1)}];
+    jobnames = [jobnames {makedirid(options.outputdir,1)}];
     jobids = [];
     jobids = [jobids chpcrun(jobnames{end},'fitnonlinearmodel',options.numperjob, ...
                              1,ceil(length(options.vxs)/options.numperjob),[], ...
@@ -642,20 +724,31 @@ results.R2 =       NaN*zeros(numvxs,numfits);
 results.gain =     NaN*zeros(numvxs,numfits);
 results.resnorms = cell(numvxs,1);
 results.numiters = cell(numvxs,1);
+if options.xvalmode ~= 0
+  results.testperformance =           NaN*zeros(numvxs,numfits);
+  results.aggregatedtestperformance = NaN*zeros(numvxs,1);
+end
 
 % massage model parameters for output and put in 'results' struct
-results.ang(options.vxs,:) =    permute(mod(atan2((1+res(1))/2 - paramsA(:,1,:), ...
-                                                  paramsA(:,2,:) - (1+res(2))/2),2*pi)/pi*180,[3 1 2]);
-results.ecc(options.vxs,:) =    permute(sqrt(((1+res(1))/2 - paramsA(:,1,:)).^2 + ...
-                                             (paramsA(:,2,:) - (1+res(2))/2).^2),[3 1 2]);
-results.expt(options.vxs,:) =   permute(posrect(paramsA(:,5,:)),[3 1 2]);
-results.rfsize(options.vxs,:) = permute(abs(paramsA(:,3,:)) ./ sqrt(posrect(paramsA(:,5,:))),[3 1 2]);
+results.ang(options.vxs,:) =    permute(mod(atan2((1+resmx)/2 - paramsA(:,1,:), ...
+                                                  paramsA(:,2,:) - (1+resmx)/2),2*pi)/pi*180,[3 1 2]);
+results.ecc(options.vxs,:) =    permute(sqrt(((1+resmx)/2 - paramsA(:,1,:)).^2 + ...
+                                             (paramsA(:,2,:) - (1+resmx)/2).^2),[3 1 2]);
+results.expt(options.vxs,:) =   permute(posrect(paramsA(:,5,:),options.exptlowerbound),[3 1 2]);
+results.rfsize(options.vxs,:) = permute(abs(paramsA(:,3,:)) ./ sqrt(posrect(paramsA(:,5,:),options.exptlowerbound)),[3 1 2]);
 results.R2(options.vxs,:) =     permute(rA,[2 1]);
 results.gain(options.vxs,:) =   permute(posrect(paramsA(:,4,:)),[3 1 2]);
 if ~wantquick
   results.resnorms(options.vxs) = a1.resnorms;
   results.numiters(options.vxs) = a1.numiters;
 end
+if options.xvalmode ~= 0
+  results.testperformance(options.vxs,:) =         permute(a1.testperformance,[2 1]);
+  results.aggregatedtestperformance(options.vxs) = a1.aggregatedtestperformance;
+end
+
+% check for special case of ecc==0; set angle to NaN since it is undefined
+results.ang(results.ecc==0) = NaN;
 
 % reshape
 results.ang =      reshape(results.ang,      [xyzsize numfits]);
@@ -666,6 +759,10 @@ results.R2 =       reshape(results.R2,       [xyzsize numfits]);
 results.gain =     reshape(results.gain,     [xyzsize numfits]);
 results.resnorms = reshape(results.resnorms, [xyzsize 1]);
 results.numiters = reshape(results.numiters, [xyzsize 1]);
+if options.xvalmode ~= 0
+  results.testperformance =           reshape(results.testperformance,[xyzsize numfits]);
+  results.aggregatedtestperformance = reshape(results.aggregatedtestperformance,[xyzsize 1]);
+end
 
 % add some more stuff
 results.meanvol =  meanvol;
@@ -728,7 +825,7 @@ fprintf('*** analyzePRF: ended at %s (%.1f minutes). ***\n', ...
 %                    2*res(1)-1 2*res(2)-1 Inf  Inf Inf repmat(Inf,[1 numinhrf])] @(ss)modelfun} ...
 %          {@(ss)ss [1-res(1)+1 1-res(2)+1 0    0   0   repmat(-Inf,[1 numinhrf]);
 %                    2*res(1)-1 2*res(2)-1 Inf  Inf Inf repmat(Inf,[1 numinhrf])] @(ss)modelfun}};
-% 
+%
 % % if not fitting the HRF, exclude the last model step
 % if ~wantfithrf
 %   model = model(1:2);
